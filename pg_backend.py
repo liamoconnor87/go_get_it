@@ -1,3 +1,4 @@
+import functools
 import os
 import re
 import threading
@@ -15,6 +16,12 @@ from go_get_it.tables import TABLES
 
 _pool: Optional[ThreadedConnectionPool] = None
 _pool_lock = threading.Lock()
+
+# Arbitrary constant used with pg_advisory_xact_lock to serialize schema
+# creation/migration across concurrently-booting processes (e.g. gunicorn
+# workers), which otherwise race on "IF NOT EXISTS" DDL and can crash a
+# worker with a duplicate_table/duplicate_object error on startup.
+_SCHEMA_LOCK_KEY = 891273465
 
 
 def _pg_type(t: str) -> str:
@@ -35,6 +42,21 @@ def _get_pool() -> ThreadedConnectionPool:
     return _pool
 
 
+def _retry_stale_connection(fn):
+    # Pooled connections can go stale between requests (idle timeout on the
+    # DB side, network blip, etc). _conn() detects this and discards the
+    # dead connection instead of recycling it, so a single retry here always
+    # gets a fresh one. If the retry also fails, the DB is genuinely
+    # unreachable and the error should propagate.
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class PostgreSQLGoGetDB():
     TABLES = TABLES
     SEED = SEED
@@ -48,13 +70,19 @@ class PostgreSQLGoGetDB():
     def _conn(self):
         pool = _get_pool()
         conn = pool.getconn()
+        stale = False
         try:
             yield conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            # Connection is already dead - rolling back would itself raise
+            # and mask this (more useful) exception, so just discard it.
+            stale = True
+            raise
         except Exception:
             conn.rollback()
             raise
         finally:
-            pool.putconn(conn)
+            pool.putconn(conn, close=stale)
 
     def _validate_table(self, table: str):
         if table not in self.TABLES:
@@ -102,28 +130,37 @@ class PostgreSQLGoGetDB():
             except psycopg2.errors.UniqueViolation:
                 print(f"[db] warning: could not create unique index '{index_name}' due to existing duplicate rows")
 
-    def go_sync_schema(self):
+    def _sync_schema(self, cursor):
         applied_updates = {}
+        for table, schema in self.TABLES.items():
+            added_columns = self._go_sync_table_columns(cursor, table, schema)
+            if added_columns:
+                applied_updates[table] = added_columns
+        self._go_ensure_indexes(cursor)
+        return applied_updates
+
+    def go_sync_schema(self):
         with self._conn() as conn:
             cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            for table, schema in self.TABLES.items():
-                added_columns = self._go_sync_table_columns(cursor, table, schema)
-                if added_columns:
-                    applied_updates[table] = added_columns
-            self._go_ensure_indexes(cursor)
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_KEY,))
+            applied_updates = self._sync_schema(cursor)
             conn.commit()
         for table, columns in applied_updates.items():
             print(f"[db] schema sync: added columns to '{table}': {', '.join(columns)}")
 
     def go_create_db(self):
         with self._conn() as conn:
-            cursor = conn.cursor()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_KEY,))
             for table, schema in self.TABLES.items():
                 columns_sql = ', '.join([f"{col} {_pg_type(dtype)}" for col, dtype in schema.items()])
                 cursor.execute(f'CREATE TABLE IF NOT EXISTS {self._qt(table)} ({columns_sql})')
+            applied_updates = self._sync_schema(cursor)
             conn.commit()
-        self.go_sync_schema()
+        for table, columns in applied_updates.items():
+            print(f"[db] schema sync: added columns to '{table}': {', '.join(columns)}")
 
+    @_retry_stale_connection
     def go_get_all(self, table: str, params: Optional[dict] = None, count: bool = False):
         self._validate_table(table)
         safe_params = dict(params or {})
@@ -152,6 +189,7 @@ class PostgreSQLGoGetDB():
 
         return [dict(row) for row in data] if data else None
 
+    @_retry_stale_connection
     def go_get_one(self, table: str, params: Optional[dict] = None):
         self._validate_table(table)
         safe_params = dict(params or {})
@@ -169,6 +207,7 @@ class PostgreSQLGoGetDB():
 
         return dict(data) if data else None
 
+    @_retry_stale_connection
     def go_add_new(self, table: str, data: dict):
         self._validate_table(table)
         payload = dict(data)
@@ -185,6 +224,7 @@ class PostgreSQLGoGetDB():
             cursor.execute(insert, tuple(payload.values()))
             conn.commit()
 
+    @_retry_stale_connection
     def go_update(self, table: str, data: dict):
         self._validate_table(table)
         payload = dict(data)
@@ -205,6 +245,7 @@ class PostgreSQLGoGetDB():
             cursor.execute(update, tuple(update_data.values()) + (_id,))
             conn.commit()
 
+    @_retry_stale_connection
     def go_delete_it(self, table: str, data: dict):
         self._validate_table(table)
         filters = dict(data)
@@ -219,6 +260,7 @@ class PostgreSQLGoGetDB():
             cursor.execute(f"DELETE FROM {self._qt(table)} WHERE {where}", tuple(filters.values()))
             conn.commit()
 
+    @_retry_stale_connection
     def go_delete_by(self, table: str, params: dict):
         self._validate_table(table)
         safe_params = dict(params)
